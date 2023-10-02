@@ -1,66 +1,95 @@
+#![feature(local_key_cell_methods)]
+
 mod error;
+mod runtime;
 mod platform;
-mod executor;
+mod join_handle;
 
 pub mod time;
-pub mod fs;
+pub use join_handle::JoinHandle;
 
 use std::ptr;
 use std::pin::pin;
 use std::future::Future;
+use std::cell::{Cell, RefCell};
 use std::task::{Poll, Context, Waker, RawWaker, RawWakerVTable};
 
-pub use error::UringError;
-pub use executor::Executor;
+use error::UringError;
+use runtime::{Runtime, WokenTask};
+
+
+thread_local! {
+    // The lazy initializer panics, therefore enforcing that the runtime is initialized only using init()
+    // This works because init() uses .set() which does not run the lazy initializer
+    pub(crate) static RUNTIME: RefCell<Runtime> = panic!("init() has not been called on this thread!");
+
+    pub(crate) static RUNNING: Cell<bool> = const { Cell::new(false) };
+}
 
 static WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(|_| panic!(), |_| (), |_| (), |_| ());
 
-pub fn run_raw<F, B, O>(builder: B) -> Result<O, UringError>
-where
-    F: Future<Output = O>,
-    B: Fn(*const Executor) -> F
-{
+/// Initializes the thread-local runtime
+/// 
+/// This must be called at least once before calling [`run()`] on a thread
+pub fn init() -> Result<(), UringError> {
+    RUNTIME.set(Runtime::new()?);
+    Ok(())
+}
+
+/// Runs a future on the current thread, blocking it whenever waiting for IO
+pub fn run<F: Future>(root_task: F) -> F::Output {
+    RUNNING.set(true);
+
     let waker = unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &WAKER_VTABLE)) };
     let mut cx = Context::from_waker(&waker);
-
-    let exec = Executor::new()?;
-    let mut fut = pin!(builder(&exec));
+    
+    let mut root_task = pin!(root_task);
 
     loop {
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Pending => exec.wait_for_events()?,
-            Poll::Ready(val) => return Ok(val)
+        // Poll all woken up tasks
+        loop {
+            let task = RUNTIME.with_borrow_mut(|rt| rt.get_woken_task());
+
+            match task {
+                // Root task woken up
+                Some(WokenTask::RootTask) => {
+                    let poll = root_task.as_mut().poll(&mut cx);
+
+                    // Root task finished, reset runtime and return
+                    if let Poll::Ready(res) = poll {
+                        RUNTIME.with_borrow_mut(|rt| rt.reset());
+                        RUNNING.set(false);
+                        return res;
+                    }
+                },
+    
+                // Child task woken up
+                Some(WokenTask::ChildTask(mut task)) => {
+                    let poll = task.as_mut().poll(&mut cx);
+
+                    match poll {
+                        // Child task pending, return it into task list
+                        Poll::Pending => RUNTIME.with_borrow_mut(|rt| rt.return_task(task)),
+                        
+                        // Child task finished with result
+                        Poll::Ready(res) => RUNTIME.with_borrow_mut(|rt| rt.task_finished(res))
+                    }
+                },
+
+                // No more woken tasks left
+                None => break
+            }
         }
+
+        // Wait for IO events to wake up more tasks
+        RUNTIME.with_borrow_mut(|rt| rt.wait_for_io());
     }
 }
 
-#[macro_export]
-macro_rules! run {
-    (async $(move $(@$move:tt)?)? |$arg:tt $(: $ArgTy:ty)? $(,)?| $(-> $Ret:ty)? $body:block) => {
-        $crate::run_raw(|arg: *const $crate::Executor| async move {
-            // Hack solution to the problem of async blocks not being able to capture references
-            // On stable rust, the compiler cannot guarantee that the async block returned by the closure 
-            // does not outlive the Executor reference it's given, since it cannot see the closure. Therefore,
-            // it will not allow the async block to capture the reference. However, we know that the async
-            // block will not outlive the reference, since it is returned by the closure and therefore
-            // cannot outlive it. We also know that the async block will not outlive the Executor reference
-            // because it is tied to the lifetime of the reference. The compiler cannot see this, however,
-            // and so complains/errors out.
-            // We solve this by using an a raw pointer and unsafely converting it to a reference. This
-            // allows us to capture the reference without the compiler complaining. This ties the lifetime
-            // of the async block to the lifetime of the reference, which is what we want.            
-            let local = [];
+pub fn spawn<F: Future + 'static>(task: F) -> JoinHandle<F::Output> {
+    if !RUNNING.get() {
+        panic!("spawn() called outside of a run() call!")
+    }
 
-            let arg: &$crate::Executor = if true {
-                unsafe { &*arg }
-            }
-            else {
-                &local[0]
-            };
-
-            let $arg $(: $ArgTy)? = arg;
-
-            $body
-        })
-    };
+    RUNTIME.with_borrow_mut(|rt| rt.spawn(task))
 }
