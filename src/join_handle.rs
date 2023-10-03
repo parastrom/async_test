@@ -6,6 +6,12 @@ use std::task::{Context, Poll};
 
 use crate::{RUNTIME, runtime::TaskId};
 
+
+
+/// Handle to a task which can be awaited on
+/// The handle does not need to be awaited for the task to run. IF the handle is dropped, the task will still run
+/// 
+/// This is returned by [`spawn()`]
 pub struct JoinHandle<T: 'static> {
     id: TaskId,
     registered: Cell<bool>,

@@ -81,6 +81,9 @@ impl Runtime {
         self.task_wakeups = vec![0];
         self.plat.reset();
 
+        // We replace and transfer task ownership to `run()`, avoiding double borrows of the runtime. 
+        // This allows tasks to be dropped in `run()`, ensuring exclusive runtime access for each task,
+        // even during IO cancellation.
         mem::replace(&mut self.tasks, IntMap::default())
     }
 

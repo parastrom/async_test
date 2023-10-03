@@ -112,7 +112,15 @@ impl Platform {
     }
 
     pub fn reset(&mut self) {
-        _ = mem::replace(&mut self.ring, new_io_uring().unwrap());
+
+        // Clears the stores and resets the ring
+        // Gets rid of pending IO
+
+        self.ring = new_io_uring().unwrap();
+
+        self.submitted_timeouts = IntMap::default();
+        self.completed_timeouts = IntSet::default();
+        self.timespec_store = Vec::new();
     }
 }
 

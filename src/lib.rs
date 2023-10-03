@@ -37,6 +37,11 @@ pub fn init() -> Result<(), UringError> {
 }
 
 /// Runs a future on the current thread, blocking it whenever waiting for IO
+/// The passed future is the root task, which will be polled until it finishes
+/// It can spawn more tasks using [`spawn()`] to spawn child tasks. It is dropped when the root task finishes.
+/// All child tasks must finish before the root task finishes, otherwise they will be dropped.
+/// If necessary for the root task to wait for a child task, it can await on the child's 
+/// [`JoinHandle`] returned by [`spawn()`].
 pub fn run<F: Future>(root_task: F) -> F::Output {
     RUNNING.set(true);
 
