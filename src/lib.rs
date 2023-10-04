@@ -1,5 +1,6 @@
 #![feature(local_key_cell_methods)]
 
+mod key;
 mod error;
 mod runtime;
 mod platform;
