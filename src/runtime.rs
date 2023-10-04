@@ -10,10 +10,9 @@ use crate::{
     JoinHandle,
     platform::Platform,
     error::UringError,
-    key::{IoKey, TaskId}
 };
 
-
+pub type TaskId = u32;
 type Task = Pin<Box<dyn Future<Output = Box<dyn Any>>>>;
 
 pub enum WokenTask {
@@ -27,15 +26,14 @@ struct JoinHandleInfo {
 }
 
 pub struct Runtime {
-    io_key_counter: IoKey,
     task_id_counter: TaskId,
 
-    current_task: TaskId,
+    pub current_task: TaskId,
     tasks: IntMap<TaskId, Task>,
     join_handles: IntMap<TaskId, JoinHandleInfo>,
     task_wakeups: Vec<TaskId>,
 
-    plat: Platform,
+    pub plat: Platform,
 }
 
 impl Runtime {
@@ -43,41 +41,32 @@ impl Runtime {
         let plat = Platform::new()?;
 
         Ok(Self {
-            io_key_counter: 0.into(),
-            task_id_counter: 1.into(),
-            current_task: 0.into(),
+            task_id_counter: 1,
+            current_task: 0,
             tasks: IntMap::default(),
             join_handles: IntMap::default(),
-            task_wakeups: vec![0.into()], // We always start with the root task already woken up
+            task_wakeups: vec![0], // We always start with the root task already woken up
             plat
         })
     }
 
-    fn new_io_key(&mut self) -> IoKey {
-        let key = self.io_key_counter;
-        self.io_key_counter.inner = key.inner.wrapping_add(1);
-
-        key
-    }
-
     fn new_task_id(&mut self) -> TaskId {
         let id = self.task_id_counter;
-        self.task_id_counter.inner += id.inner.wrapping_add(1);
+        self.task_id_counter += id.wrapping_add(1);
 
         // TaskId 0 is reserved for the root task
-        if self.task_id_counter.inner == 0 {
-            self.task_id_counter.inner = 1;
+        if self.task_id_counter == 0 {
+            self.task_id_counter = 1;
         }
 
         id
     }
 
     pub fn reset(&mut self) -> IntMap<TaskId, Task> {
-        self.io_key_counter = 0.into();
-        self.task_id_counter = 1.into();
-        self.current_task = 0.into();
+        self.task_id_counter = 1;
+        self.current_task = 0;
         self.join_handles = IntMap::default();
-        self.task_wakeups = vec![0.into()];
+        self.task_wakeups = vec![0];
         self.plat.reset();
 
         // We replace and transfer task ownership to `run()`, avoiding double borrows of the runtime. 
@@ -125,7 +114,7 @@ impl Runtime {
         let id = self.task_wakeups.pop()?;
         self.current_task = id;
 
-        if id.inner == 0 {
+        if id == 0 {
             Some(WokenTask::RootTask)
         }
         else {
@@ -197,23 +186,7 @@ impl Runtime {
 
 impl Runtime {
 
-    /// Pushes a timeout onto the timeout queue
-    pub fn push_timeout(&mut self, dur: Duration) -> IoKey {
-        let key = self.new_io_key();
-        self.plat.push_timeout(self.current_task, key, dur);
-
-        key
-    }
-
-
-    /// Cancels a timeout
-    pub fn cancel_timeout(&mut self, key: IoKey) {
-        self.plat.cancel_timeout(key)
-    }
-
-
-    /// Pops a timeout from the timeout queue
-    pub fn pop_timeout(&mut self, key: IoKey) -> bool {
-        self.plat.pop_timeout(key)
+    pub fn sleep_fut(&mut self, dur: Duration) -> impl Future<Output = ()> {
+        self.plat.sleep_fut(dur)
     }
 }

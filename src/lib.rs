@@ -1,12 +1,12 @@
 #![feature(local_key_cell_methods)]
 
-mod key;
 mod error;
 mod runtime;
 mod platform;
 mod join_handle;
 
 pub mod time;
+pub mod net;
 pub use join_handle::JoinHandle;
 
 use std::ptr;
