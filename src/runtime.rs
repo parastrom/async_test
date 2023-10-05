@@ -111,15 +111,24 @@ impl Runtime {
     /// If the task is the root task, returns `WokenTask::RootTask`, otherwise returns
     /// `WokenTask::ChildTask(task)`.
     pub fn get_woken_task(&mut self) -> Option<WokenTask> {
-        let id = self.task_wakeups.pop()?;
-        self.current_task = id;
 
-        if id == 0 {
-            Some(WokenTask::RootTask)
-        }
-        else {
-            let task = self.tasks.remove(&id).expect("Woken up task not found in task list");
-            Some(WokenTask::ChildTask(task))
+        loop {
+            let id = self.task_wakeups.pop()?;
+            self.current_task = id;
+
+            self.current_task = id;
+            if id == 0 {
+                return Some(WokenTask::RootTask);
+            }
+            else {
+                // A woken up task id  may not be in the task list if it was woken up
+                // earlier before it's completion, and then completed before it was polled.
+                // In this case, we just ignore it and continue.
+                match self.tasks.remove(&id) {
+                    Some(task) => return Some(WokenTask::ChildTask(task)),
+                    None => continue
+                }
+            }
         }
     }
 
