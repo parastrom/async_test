@@ -1,13 +1,12 @@
 use std::io;
 use std::mem;
 use std::ptr;
-use std::array;
 use std::pin::Pin;
-use std::os::fd::RawFd;
+use std::os::fd::{RawFd, FromRawFd};
 use std::future::Future;
 use std::time::Duration;
 use std::task::{Context, Poll};
-use std::net::{SocketAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+use std::net::{SocketAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, TcpStream};
 
 use io_uring::{
     opcode,
@@ -17,7 +16,7 @@ use io_uring::{
     types::{Timespec, Fd}
 };
 
-use nohash::{IntSet, IntMap};
+use nohash::IntMap;
 
 use crate::{
     RUNTIME,
@@ -27,19 +26,21 @@ use crate::{
 
 type IoKey = u32;
 
+const MAX_LIBC_SOCKADDR_SIZE: usize = mem::size_of::<libc::sockaddr_in6>();
+
+#[derive(Clone, Copy)]
+enum FutState {
+    NotSubmitted,
+    Submitted(IoKey),
+    Done
+}
+
 pub struct Platform {
     ring: IoUring,
     io_key_counter: IoKey,
 
-    submitted_timeouts: IntMap<IoKey, TaskId>,
-    completed_timeouts: IntSet<IoKey>,
-    timespec_store: Vec<Box<Timespec>>,
-
-    submitted_recv_msgs: IntMap<IoKey, TaskId>,
-    completed_recv_msgs: IntMap<IoKey, io::Result<usize>>,
-
-    submitted_send_msgs: IntMap<IoKey, TaskId>,
-    completed_send_msgs: IntMap<IoKey, io::Result<usize>>
+    submissions: IntMap<IoKey, TaskId>,
+    completions: IntMap<IoKey, i32>,
 }
 
 impl Platform {
@@ -47,56 +48,43 @@ impl Platform {
         Ok(Self {
             ring: new_io_uring()?,
             io_key_counter: 0,
-
-            submitted_timeouts: IntMap::default(),
-            completed_timeouts: IntSet::default(),
-            timespec_store: Vec::new(),
-
-            submitted_recv_msgs: IntMap::default(),
-            completed_recv_msgs: IntMap::default(),
-
-            submitted_send_msgs: IntMap::default(),
-            completed_send_msgs: IntMap::default(),
+            submissions: IntMap::default(),
+            completions: IntMap::default()
         })
     }
 
     // Returns future for sleeping
     pub fn sleep_fut(&self, dur: Duration) -> impl Future<Output = ()> {
-        enum FutState {
-            NotSubmitted(Duration),
-            Submitted(IoKey),
-            Done
+        struct TimeoutFut {
+            timespec: Timespec,
+            state: FutState
         }
 
-        struct SleepFut(FutState);
 
-        impl Future for SleepFut {
+        impl Future for TimeoutFut {
             type Output = ();
 
             fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-                match self.0 {
+                match self.state {
                     // Timeout not submitted yet
-                    FutState::NotSubmitted(dur) => RUNTIME.with_borrow_mut(|rt| {
+                    FutState::NotSubmitted => RUNTIME.with_borrow_mut(|rt| {
                         let key = rt.plat.new_io_key();
-                        self.0 = FutState::Submitted(key);
+                        self.state = FutState::Submitted(key);
 
-                        rt.plat.submitted_timeouts.insert(key, rt.current_task);
-
-                        let timespec = Box::new(Timespec::from(dur));
-                        let sqe = opcode::Timeout::new(timespec.as_ref())
+                        let sqe = opcode::Timeout::new(&self.timespec)
                             .build()
                             .user_data(key as u64);
 
-                        rt.plat.timespec_store.push(timespec);
                         rt.plat.submit_sqe(sqe);
+                        rt.plat.submissions.insert(key, rt.current_task);
 
                         Poll::Pending
                     }),
 
                     // Timeout submitted, query it
                     FutState::Submitted(key) => RUNTIME.with_borrow_mut(|rt| {
-                        if rt.plat.completed_timeouts.remove(&key) {
-                            self.0 = FutState::Done;
+                        if rt.plat.submissions.remove(&key).is_some() {
+                            self.state = FutState::Done;
                             Poll::Ready(())
                         }
                         else {
@@ -109,11 +97,11 @@ impl Platform {
             }
         }
 
-        impl Drop for SleepFut {
+        impl Drop for TimeoutFut {
             fn drop(&mut self) {
-                if let FutState::Submitted(key) = &self.0 {
+                if let FutState::Submitted(key) = &self.state {
                     RUNTIME.with_borrow_mut(|rt| {
-                        if rt.plat.submitted_timeouts.remove(key).is_some() {
+                        if rt.plat.submissions.remove(key).is_some() {
                             let sqe = opcode::TimeoutRemove::new(*key as u64).build();
                             rt.plat.submit_sqe(sqe);   
                         }
@@ -122,19 +110,87 @@ impl Platform {
             }
         }
 
-        SleepFut(FutState::NotSubmitted(dur))
+        TimeoutFut {
+            timespec: Timespec::from(dur),
+            state: FutState::NotSubmitted
+        }
+    }
+
+    pub fn recv_fut<'a>(&self, sock: SocketHandle, buf: &'a mut [u8], peek: bool) -> impl Future<Output = io::Result<usize>> + 'a {
+        struct RecvFut{
+            sock: RawFd,
+            buf: *mut u8,
+            len: u32,
+            peek: bool,
+            state: FutState
+        }
+
+        impl Future for RecvFut {
+            type Output = io::Result<usize>;
+
+            fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                match self.state {
+                    // Recv not submitted yet
+                    FutState::NotSubmitted => RUNTIME.with_borrow_mut(|rt| {
+                        let key = rt.plat.new_io_key();
+                        self.state = FutState::Submitted(key);
+
+                        let sqe = opcode::Recv::new(Fd(self.sock), self.buf, self.len)
+                            .flags(if self.peek { libc::MSG_PEEK } else { 0 })
+                            .build()
+                            .user_data(key as u64);
+
+                        rt.plat.submit_sqe(sqe);
+                        rt.plat.submissions.insert(key, rt.current_task);
+
+                        Poll::Pending
+                    }),
+
+                    // Recv submitted, query it
+                    FutState::Submitted(key) => RUNTIME.with_borrow_mut(|rt| {
+                        match rt.plat.completions.remove(&key) {
+                            Some(res) => {
+                                self.state = FutState::Done;
+                                let bytes = libc_result_to_std(res).map(|bytes| bytes as usize);
+                                Poll::Ready(bytes)
+                            },
+
+                            None => Poll::Pending
+                        }
+                    }),
+
+                    FutState::Done => panic!("RecvFut polled even after completing")
+                }
+            }
+        }
+
+        impl Drop for RecvFut {
+            fn drop(&mut self) {
+                if let FutState::Submitted(key) = &self.state {
+                    RUNTIME.with_borrow_mut(|rt| {
+                        if rt.plat.submissions.remove(key).is_some() {
+                            let sqe = opcode::AsyncCancel::new(*key as u64).build();
+                            rt.plat.submit_sqe(sqe);   
+                        }
+                    });
+                }
+            }
+        }
+
+        RecvFut {
+            sock: sock.0,
+            buf: buf.as_mut_ptr(),
+            len: buf.len() as u32,
+            peek,
+            state: FutState::NotSubmitted
+        }
     }
 
     // Returns future for socket recv_froms & peek_froms
     pub fn recv_from_fut<'a>(&self, sock: SocketHandle, buf: &'a mut [u8], peek: bool) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + 'a {
-        #[derive(Clone, Copy)]
-        enum FutState {
-            NotSubmitted(RawFd),
-            Submitted(IoKey),
-            Done
-        }
 
         struct RecvMsgFut {
+            sock: RawFd,
             src_addr: *mut libc::sockaddr,
             msghdr: *mut libc::msghdr,
             state: FutState
@@ -146,31 +202,34 @@ impl Platform {
             fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
                 match self.state {
                     // RecvMsg not submitted yet
-                    FutState::NotSubmitted(sock) => RUNTIME.with_borrow_mut(|rt| {
+                    FutState::NotSubmitted => RUNTIME.with_borrow_mut(|rt| {
                         let key = rt.plat.new_io_key();
                         self.state = FutState::Submitted(key);
 
-                        rt.plat.submitted_recv_msgs.insert(key, rt.current_task);
-
-                        let sqe = opcode::RecvMsg::new(Fd(sock), self.msghdr)
-                                .build()
-                                .user_data(key as u64);
+                        let sqe = opcode::RecvMsg::new(Fd(self.sock), self.msghdr)
+                        .build()
+                        .user_data(key as u64);
 
                         rt.plat.submit_sqe(sqe);
+                        rt.plat.submissions.insert(key, rt.current_task);
 
                         Poll::Pending
                     }),
 
                     // RecvMsg submitted, query it
                     FutState::Submitted(key) => RUNTIME.with_borrow_mut(|rt| {
-                        match rt.plat.completed_recv_msgs.remove(&key) {
-                            Some(bytes) => {
+                        match rt.plat.completions.remove(&key) {
+                            Some(res) => {
                                 self.state = FutState::Done;
 
-                                let src_addr = unsafe { &*self.src_addr };
-                                let src_addr = libc_addr_to_std(src_addr);
+                                let bytes = libc_result_to_std(res).map(|bytes| bytes as usize);
 
-                                let res = bytes.map(|bytes| (bytes, src_addr));
+                                let res = bytes.map(|bytes| {
+                                    let src_addr = unsafe { &*self.src_addr };
+                                    let src_addr = libc_addr_to_std(src_addr);
+
+                                    (bytes, src_addr)
+                                });
                                 Poll::Ready(res)
                             },
 
@@ -178,7 +237,7 @@ impl Platform {
                         }
                     }),
 
-                    FutState::Done => panic!("RecvFromFut polled even after completing"),
+                    FutState::Done => panic!("RecvMsgFut polled even after completing"),
                 }
             }
         }
@@ -187,7 +246,7 @@ impl Platform {
             fn drop(&mut self) {
                 if let FutState::Submitted(key) = &self.state {
                     RUNTIME.with_borrow_mut(|rt| {
-                        if rt.plat.submitted_recv_msgs.remove(key).is_some() {
+                        if rt.plat.submissions.remove(key).is_some() {
                             let sqe = opcode::AsyncCancel::new(*key as u64).build();
                             rt.plat.submit_sqe(sqe);
                         }                        
@@ -205,13 +264,10 @@ impl Platform {
                 iov_len: buf.len()
             };
 
-            let mut src_addr = libc::sockaddr {
-                sa_data: [0; 14],
-                sa_family: 0
-            };
+            let mut src_addr = [0u8; MAX_LIBC_SOCKADDR_SIZE];
 
             let mut msghdr = libc::msghdr {
-                msg_name: &mut src_addr as *mut libc::sockaddr as *mut _,
+                msg_name: src_addr.as_mut_ptr() as *mut _,
                 msg_namelen: mem::size_of::<libc::sockaddr>() as u32,
                 msg_iov: &mut iovec,
                 msg_iovlen: 1,
@@ -221,22 +277,18 @@ impl Platform {
             };
 
             RecvMsgFut {
-                src_addr: &mut src_addr,
+                sock: sock.0,
+                src_addr: src_addr.as_mut_ptr() as *mut _,
                 msghdr: &mut msghdr,
-                state: FutState::NotSubmitted(sock.0)
+                state: FutState::NotSubmitted
             }.await
         }
     }
 
     pub fn send_to_fut<'a>(&self, sock: SocketHandle, buf: &'a [u8], addr: Option<SocketAddr>) -> impl Future<Output = io::Result<usize>> + 'a {
-        #[derive(Clone, Copy)]
-        enum FutState {
-            NotSubmitted(RawFd),
-            Submitted(IoKey),
-            Done
-        }
 
         struct SendMsgFut {
+            sock: RawFd,
             msghdr: *mut libc::msghdr,
             state: FutState
         }
@@ -247,25 +299,25 @@ impl Platform {
             fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
                 match self.state {
                     // SendMsg not submitted yet
-                    FutState::NotSubmitted(sock) => RUNTIME.with_borrow_mut(|rt| {
+                    FutState::NotSubmitted => RUNTIME.with_borrow_mut(|rt| {
                         let key = rt.plat.new_io_key();
                         self.state = FutState::Submitted(key);
 
-                        rt.plat.submitted_send_msgs.insert(key, rt.current_task);
-
-                        let sqe = opcode::SendMsg::new(Fd(sock), self.msghdr)
-                                .build()
-                                .user_data(key as u64);
+                        let sqe = opcode::SendMsg::new(Fd(self.sock), self.msghdr)
+                        .build()
+                        .user_data(key as u64);
 
                         rt.plat.submit_sqe(sqe);
+                        rt.plat.submissions.insert(key, rt.current_task);
                         Poll::Pending
                     }),
 
                     // SendMsg submitted, query it
                     FutState::Submitted(key) => RUNTIME.with_borrow_mut(|rt| {
-                        match rt.plat.completed_send_msgs.remove(&key) {
-                            Some(bytes) => {
+                        match rt.plat.completions.remove(&key) {
+                            Some(res) => {
                                 self.state = FutState::Done;
+                                let bytes = libc_result_to_std(res).map(|bytes| bytes as usize);
                                 Poll::Ready(bytes)
                             },
 
@@ -273,7 +325,7 @@ impl Platform {
                         }
                     }),
 
-                    FutState::Done => panic!("SendToFut polled even after completing"),
+                    FutState::Done => panic!("SendMsgFut polled even after completing"),
                 }
             }
         }
@@ -282,7 +334,7 @@ impl Platform {
             fn drop(&mut self) {
                 if let FutState::Submitted(key) = &self.state {
                     RUNTIME.with_borrow_mut(|rt| {
-                        if rt.plat.submitted_send_msgs.remove(key).is_some() {
+                        if rt.plat.submissions.remove(key).is_some() {
                             let sqe = opcode::AsyncCancel::new(*key as u64).build();
                             rt.plat.submit_sqe(sqe);
                         }                        
@@ -300,19 +352,19 @@ impl Platform {
                 iov_len: buf.len()
             };
 
-            let mut dst_addr = match &addr {
-                // send_to operation for unconnected socket
-                // Address needs to be specified
-                Some(addr) => std_addr_to_libc(addr),
-
-                // send operation for connected socket
-                // No address needs to be specified
-                None => [0; MAX_LIBC_SOCKADDR_SIZE]
-            };
+            // If the socket is connected, the address needs to be specified, otherwise
+            // the kernel will use the address the socket is connected to.
+            let mut dst_addr = addr.map(|addr| std_addr_to_libc(&addr));
 
             let mut msghdr = libc::msghdr {
-                msg_name: dst_addr.as_mut_ptr() as *mut _,
-                msg_namelen: if addr.is_some() { dst_addr.len() as u32 } else { 0 },
+                msg_name: match &mut dst_addr {
+                    Some(dst_add) => dst_add.as_mut_ptr() as *mut _,
+                    None => ptr::null_mut()
+                },
+                msg_namelen: match dst_addr {
+                    Some(dst_addr) => dst_addr.len() as u32,
+                    None => 0
+                },
                 msg_iov: &mut iovec,
                 msg_iovlen: 1,
                 msg_control: ptr::null_mut(),
@@ -320,7 +372,90 @@ impl Platform {
                 msg_flags: 0
             };
 
-            SendMsgFut { msghdr: &mut msghdr, state: FutState::NotSubmitted(sock.0) }.await
+            SendMsgFut {
+                sock: sock.0,
+                msghdr: &mut msghdr,
+                state: FutState::NotSubmitted
+            }.await
+        }
+    }
+
+    pub fn accept_fut(&self, sock: SocketHandle) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> {
+        struct AcceptFut {
+            sock: RawFd,
+            sockaddr: [u8; MAX_LIBC_SOCKADDR_SIZE], // Buffer with sufficient space to hold the largest sockaddr that we're expecting
+            addrlen: libc::socklen_t,
+            state: FutState
+        }
+
+        impl Future for AcceptFut {
+            type Output = io::Result<(TcpStream, SocketAddr)>;
+
+            fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                match self.state {
+                    // Accept not submitted yet
+                    FutState::NotSubmitted => RUNTIME.with_borrow_mut(|rt| {
+                        let key = rt.plat.new_io_key();
+                        self.state = FutState::Submitted(key);
+
+                        let addr = self.sockaddr.as_mut_ptr() as *mut libc::sockaddr;
+
+                        let sqe = opcode::Accept::new(Fd(self.sock), addr, &mut self.addrlen)
+                            .build()
+                            .user_data(key as u64);
+
+                        rt.plat.submit_sqe(sqe);
+                        rt.plat.submissions.insert(key, rt.current_task);
+
+                        Poll::Pending
+                    }),
+
+                    // Accept submitted, query it
+                    FutState::Submitted(key) => RUNTIME.with_borrow_mut(|rt| {
+                        match rt.plat.completions.remove(&key) {
+                            Some(res) => {
+                                self.state = FutState::Done;
+
+                                let fd = libc_result_to_std(res);
+
+                                let res = fd.map(|fd| {
+                                    let stream = unsafe { TcpStream::from_raw_fd(fd) };
+
+                                    let peer_addr = unsafe { &*(self.sockaddr.as_ptr() as *const libc::sockaddr) };
+                                    let peer_addr = libc_addr_to_std(peer_addr);
+
+                                    (stream, peer_addr)
+                                });
+                                Poll::Ready(res)
+                            },
+
+                            None => Poll::Pending
+                        }
+                    }),
+
+                    FutState::Done => panic!("AcceptFut polled even after completing"),
+                }
+            }
+        }
+
+        impl Drop for AcceptFut {
+            fn drop(&mut self) {
+                if let FutState::Submitted(key) = &self.state {
+                    RUNTIME.with_borrow_mut(|rt| {
+                        if rt.plat.submissions.remove(key).is_some() {
+                            let sqe = opcode::AsyncCancel::new(*key as u64).build();
+                            rt.plat.submit_sqe(sqe);
+                        }                        
+                    });
+                }
+            }
+        }
+
+        AcceptFut {
+            sock: sock.0,
+            sockaddr: [0u8; MAX_LIBC_SOCKADDR_SIZE],
+            addrlen: MAX_LIBC_SOCKADDR_SIZE as libc::socklen_t,
+            state: FutState::NotSubmitted
         }
     }
 
@@ -329,33 +464,12 @@ impl Platform {
             .submit_and_wait(1)
             .expect("Failed to submit io_uring");
 
-        self.clear_stores();
 
         for cqe in self.ring.completion() {
             let key = IoKey::from(cqe.user_data() as u32);
 
-            // Is this a Timeout completion?
-            if let Some(task_id) = self.submitted_timeouts.remove(&key) {
-                self.completed_timeouts.insert(key);
-                wakeups.push(task_id);
-            } else if let Some(task_id) = self.submitted_recv_msgs.remove(&key) { // Is this a RecvMsg completion?
-                let res = if cqe.result() >= 0 {
-                    Ok(cqe.result() as usize)
-                }
-                else {
-                    Err(io::Error::from_raw_os_error(-cqe.result()))
-                };
-                self.completed_recv_msgs.insert(key, res);
-                wakeups.push(task_id);
-            }  else if let Some(task_id) = self.submitted_send_msgs.remove(&key) {
-                let res = if cqe.result() >= 0 {
-                    Ok(cqe.result() as usize)
-                }
-                else {
-                    Err(io::Error::from_raw_os_error(-cqe.result()))
-                };
-
-                self.completed_send_msgs.insert(key, res);
+            if let Some(task_id) = self.submissions.remove(&key) {
+                self.completions.insert(key, cqe.result());
                 wakeups.push(task_id);
             }
         }
@@ -395,26 +509,15 @@ impl Platform {
                     self.ring
                         .submit()
                         .expect("Failed to submit io_uring");
-
-                    // Stores not needed after submission (submit_stable feature)
-                    self.clear_stores();
                 }
             }
         }
     }
 
-    fn clear_stores(&mut self) {
-        self.timespec_store.clear();
-    }
 }
 
 fn new_io_uring() -> Result<IoUring, UringError> {
     let ring = IoUring::new(128).map_err(|err| UringError::FailedInit(err))?;
-
-    // Check required features
-    if !ring.params().is_feature_submit_stable() {
-        return Err(UringError::UnsupportedFeature("submit_stable"));
-    }
 
     if !ring.params().is_feature_nodrop() {
         return Err(UringError::UnsupportedFeature("no_drop"));
@@ -459,15 +562,7 @@ fn libc_addr_to_std(addr: &libc::sockaddr) -> SocketAddr {
         // Reinterpret as sockaddr_in6
         let addr = unsafe { &*(addr as *const libc::sockaddr as *const libc::sockaddr_in6) };
 
-        // Get params, converting from network to host endianness
-        let segments = array::from_fn(|i| {
-            let octet_1 = addr.sin6_addr.s6_addr[i * 2] as u16;
-            let octet_2 = addr.sin6_addr.s6_addr[(i * 2) + 1] as u16;
-
-            u16::from_be(octet_1 << 8 | octet_2)
-        });
-
-        let ip = Ipv6Addr::from(segments);
+        let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
         let port = u16::from_be(addr.sin6_port);
         let flowinfo = u32::from_be(addr.sin6_flowinfo);
         let scope_id = u32::from_be(addr.sin6_scope_id);
@@ -478,10 +573,9 @@ fn libc_addr_to_std(addr: &libc::sockaddr) -> SocketAddr {
     }
 }
 
-const MAX_LIBC_SOCKADDR_SIZE: usize = mem::size_of::<libc::sockaddr_in6>();
 
 fn std_addr_to_libc(addr: &SocketAddr) -> [u8; MAX_LIBC_SOCKADDR_SIZE] {
-    let mut buf = [0; MAX_LIBC_SOCKADDR_SIZE];
+    let mut buf = [0u8; MAX_LIBC_SOCKADDR_SIZE];
 
     match addr {
         // IPv4 address
@@ -493,7 +587,6 @@ fn std_addr_to_libc(addr: &SocketAddr) -> [u8; MAX_LIBC_SOCKADDR_SIZE] {
             out_addr.sin_family = libc::AF_INET as libc::sa_family_t;
             out_addr.sin_port = u16::to_be(addr.port());
             out_addr.sin_addr.s_addr = u32::to_be(u32::from(*addr.ip()));
-            out_addr.sin_zero = [0; 8];
         },
 
         // IPv6 address
@@ -515,4 +608,15 @@ fn std_addr_to_libc(addr: &SocketAddr) -> [u8; MAX_LIBC_SOCKADDR_SIZE] {
     }
 
     buf
-} 
+}
+
+fn libc_result_to_std(res: i32) -> io::Result<i32> {
+    // Positive res means okay, negative means error and is equal
+    // to the negated error code
+    if res >= 0 {
+        Ok(res)
+    }
+    else {
+        Err(io::Error::from_raw_os_error(-res))
+    }
+}

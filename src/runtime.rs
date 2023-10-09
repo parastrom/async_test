@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::future::Future;
 use std::time::Duration;
 use std::os::fd::AsRawFd;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs, TcpStream};
 
 use nohash::IntMap;
 
@@ -20,12 +20,12 @@ pub type TaskId = u32;
 #[cfg(unix)]
 pub struct SocketHandle(pub std::os::fd::RawFd);
 
-impl From<&UdpSocket> for SocketHandle {
-    fn from(value: &UdpSocket) -> Self {
-        #[cfg(unix)]
+impl<T: AsRawFd> From<&T> for SocketHandle {
+    fn from(value: &T) -> Self {
         Self(value.as_raw_fd())
     }
 }
+
 
 type Task = Pin<Box<dyn Future<Output = Box<dyn Any>>>>;
 
@@ -213,6 +213,10 @@ impl Runtime {
         self.plat.sleep_fut(dur)
     }
 
+    // Futures for socket IO
+    pub fn recv_fut<'a>(&self, sock: SocketHandle, buf: &'a mut [u8], peek: bool) -> impl Future<Output = io::Result<usize>> + 'a {
+        self.plat.recv_fut(sock, buf, peek)
+    }
 
     pub fn recv_from_fut<'a>(&self, sock: SocketHandle, buf: &'a mut [u8], peek: bool) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + 'a {
         self.plat.recv_from_fut(sock, buf, peek)
@@ -230,5 +234,9 @@ impl Runtime {
             .expect("Address iterator didn't provide any addresses");
 
         self.plat.send_to_fut(sock, buf, Some(addr))
+    }
+
+    pub fn accept_fut(&self, sock: SocketHandle) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> {
+        self.plat.accept_fut(sock)
     }
 }
