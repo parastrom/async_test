@@ -3,9 +3,7 @@ use std::mem;
 use std::any::Any;
 use std::pin::Pin;
 use std::future::Future;
-use std::time::Duration;
 use std::os::fd::AsRawFd;
-use std::net::{SocketAddr, ToSocketAddrs, TcpStream};
 
 use nohash::IntMap;
 
@@ -203,40 +201,5 @@ impl Runtime {
     /// remove the join handle info from the list so that the task's result is discarded
     pub fn drop_join_handle(&mut self, id: TaskId) {
         self.join_handles.remove(&id);
-    }
-}
-
-
-impl Runtime {
-
-    pub fn sleep_fut(&mut self, dur: Duration) -> impl Future<Output = ()> {
-        self.plat.sleep_fut(dur)
-    }
-
-    // Futures for socket IO
-    pub fn recv_fut<'a>(&self, sock: SocketHandle, buf: &'a mut [u8], peek: bool) -> impl Future<Output = io::Result<usize>> + 'a {
-        self.plat.recv_fut(sock, buf, peek)
-    }
-
-    pub fn recv_from_fut<'a>(&self, sock: SocketHandle, buf: &'a mut [u8], peek: bool) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + 'a {
-        self.plat.recv_from_fut(sock, buf, peek)
-    }
-
-    pub fn send_fut<'a>(&self, sock: SocketHandle, buf: &'a [u8]) -> impl Future<Output = io::Result<usize>> + 'a {
-        self.plat.send_to_fut(sock, buf, None)
-    }
-
-    pub fn send_to_fut<'a>(&self, sock: SocketHandle, buf: &'a [u8], addr: impl ToSocketAddrs) -> impl Future<Output = io::Result<usize>> + 'a {
-        let addr = addr
-            .to_socket_addrs()
-            .expect("Could not get address iterator")
-            .next()
-            .expect("Address iterator didn't provide any addresses");
-
-        self.plat.send_to_fut(sock, buf, Some(addr))
-    }
-
-    pub fn accept_fut(&self, sock: SocketHandle) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> {
-        self.plat.accept_fut(sock)
     }
 }
