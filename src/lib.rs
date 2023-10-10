@@ -7,6 +7,7 @@ mod join_handle;
 
 pub mod time;
 pub mod net;
+pub mod util;
 pub use join_handle::JoinHandle;
 
 use std::ptr;
@@ -15,7 +16,7 @@ use std::future::Future;
 use std::cell::{Cell, RefCell};
 use std::task::{Poll, Context, Waker, RawWaker, RawWakerVTable};
 
-use error::UringError;
+pub use error::UringError;
 use runtime::{Runtime, WokenTask};
 
 
