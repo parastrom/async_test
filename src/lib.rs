@@ -5,6 +5,7 @@ mod runtime;
 mod platform;
 mod join_handle;
 
+pub mod fs;
 pub mod time;
 pub mod net;
 pub mod util;

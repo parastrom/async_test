@@ -36,6 +36,7 @@ where
     }
 }
 
+/// Returns the first future to finish
 pub async fn or<T, F1, F2>(fut1: F1, fut2: F2) -> T
 where
     F1: Future<Output = T>,
@@ -91,6 +92,7 @@ where
     }
 }
 
+/// Joins two futures into a tuple
 pub async fn zip<F1, F2>(fut1: F1, fut2: F2) -> (F1::Output, F2::Output)
 where
     F1: Future,
@@ -152,7 +154,7 @@ where
         }
     }
 }
-
+/// Tries to join two futures into a tuple
 pub async fn try_zip<F1, T1, F2, T2, E>(fut1: F1, fut2: F2) -> Result<(T1, T2), E>
 where
     F1: Future<Output = Result<T1, E>>,

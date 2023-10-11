@@ -1,8 +1,7 @@
 use std::io::Result;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{SocketAddr, ToSocketAddrs, Shutdown};
 use std::mem::ManuallyDrop;
 
-use crate::{platform, runtime::SocketHandle};
 use crate::{
     util::try_zip,
     platform::{
@@ -12,6 +11,7 @@ use crate::{
         socket_recv,
         socket_send,
         socket_accept,
+        socket_shutdown,
     }
 };
 
@@ -21,29 +21,25 @@ impl TcpStream {
     pub async fn connect<A: ToSocketAddrs>(addr: A) -> Result<Self> {
         let addr_iter = addr.to_socket_addrs().expect("Couldn't get address iterator");
 
-        // Since each address can be either IPv4 or IPv6, we create one socket for each type
-        let (sock_v4, sock_v6) = try_zip(
-            async {
-                let stream = socket_create::<std::net::TcpStream>(false, false).await;
-                stream.map(|stream| ManuallyDrop::new(stream))
-            },
-
-            async {
-                let stream = socket_create::<std::net::TcpStream>(true, false).await;
-                stream.map(|stream| ManuallyDrop::new(stream))
-            },
+        let (stream_v4, stream_v6) = try_zip(
+            socket_create::<std::net::TcpStream>(false, false), 
+            socket_create::<std::net::TcpStream>(true, false)
         ).await?;
+
+        // Prevent the streams from being auto dropped since we need to manually drop them
+        let stream_v4 = ManuallyDrop::new(stream_v4);
+        let stream_v6 = ManuallyDrop::new(stream_v6);
 
         let mut res = None;
 
         for addr in addr_iter {
             match addr {
                 SocketAddr::V4(_) => {
-                    match socket_connect(&*sock_v4, &addr).await {
+                    match socket_connect(&*stream_v4, &addr).await {
                         Ok(()) => {
-                            socket_close(&*sock_v6);
-                            sock_v4.set_nonblocking(true)?;
-                            return Ok(Self(sock_v4));
+                            socket_close(&*stream_v6);
+                            stream_v4.set_nonblocking(true)?;
+                            return Ok(Self(stream_v4));
                         },
 
                         Err(err) => res = Some(err)
@@ -51,11 +47,11 @@ impl TcpStream {
                 },
 
                 SocketAddr::V6(_) => {
-                    match socket_connect(&*sock_v6, &addr).await {
+                    match socket_connect(&*stream_v6, &addr).await {
                         Ok(()) => {
-                            socket_close(&*sock_v4);
-                            sock_v6.set_nonblocking(true)?;
-                            return Ok(Self(sock_v6));
+                            socket_close(&*stream_v4);
+                            stream_v6.set_nonblocking(true)?;
+                            return Ok(Self(stream_v6));
                         },
 
                         Err(err) => res = Some(err)
@@ -80,6 +76,10 @@ impl TcpStream {
 
     pub async fn write(&self, buf: &[u8]) -> Result<usize> {
         socket_send(&*self.0, buf).await
+    }
+
+    pub async fn shutdown(&self, how: Shutdown) -> Result<()> {
+        socket_shutdown(&*self.0, how).await
     }
 }
 

@@ -2,11 +2,12 @@ use std::io;
 use std::mem;
 use std::ptr;
 use std::pin::Pin;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::path::Path;
+use std::os::{fd::{AsRawFd, FromRawFd}, unix::ffi::OsStrExt};
 use std::future::Future;
 use std::time::Duration;
 use std::task::{Context, Poll};
-use std::net::{SocketAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, TcpStream};
+use std::net::{SocketAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, TcpStream, Shutdown};
 
 use io_uring::{
     opcode,
@@ -19,6 +20,7 @@ use io_uring::{
 use nohash::IntMap;
 
 use crate::{
+    fs::OpenOptions,
     RUNTIME,
     runtime::{TaskId},
     error::UringError
@@ -99,6 +101,43 @@ pub async fn sleep(dur: Duration) {
     let sqe = opcode::Timeout::new(&timespec).build();
 
     UringFut::new(sqe).await;
+}
+
+pub async fn file_open<T: FromRawFd>(path: &Path, opts: &OpenOptions) -> io::Result<T> {
+    let mut flags = match (opts.read, opts.write) {
+        (true, false) => libc::O_RDONLY,
+        (false, true) => libc::O_WRONLY,
+        (true, true) => libc::O_RDWR,
+        (false, false) => 0
+    };
+
+    if opts.append {
+        flags |= libc::O_APPEND;
+    }
+
+    if opts.truncate {
+        flags |= libc::O_TRUNC;
+    }
+
+    if opts.create || opts.create_new {
+        flags |= libc::O_CREAT;
+    }
+
+    if opts.create_new {
+        flags |= libc::O_EXCL;
+    }
+
+    let dirfd = Fd(libc::AT_FDCWD);
+    let path = path.as_os_str().as_bytes();
+
+    let sqe = opcode::OpenAt::new(dirfd, (*path).as_ptr() as *const _)
+        .flags(flags)
+        .mode(0o666)
+        .build();
+
+    let res = UringFut::new(sqe).await;
+
+    libc_result_to_std(res).map(|fd| unsafe { T::from_raw_fd(fd) })
 }
 
 pub async fn socket_create<T: FromRawFd>(ipv6: bool, udp: bool) -> io::Result<T> {
@@ -232,6 +271,19 @@ pub async fn socket_accept<T: AsRawFd>(sock: &T) -> io::Result<(TcpStream, Socke
 
         (stream, peer_addr)
     })
+}
+
+pub async fn socket_shutdown<T: AsRawFd>(sock: &T, how: Shutdown) -> io::Result<()> {
+    let how = match how {
+        Shutdown::Read => libc::SHUT_RD,
+        Shutdown::Write => libc::SHUT_WR,
+        Shutdown::Both => libc::SHUT_RDWR
+    };
+
+    let sqe = opcode::Shutdown::new(Fd(sock.as_raw_fd()), how).build();
+    let res = UringFut::new(sqe).await;
+
+    libc_result_to_std(res).map(|_| ())
 }
 
 pub struct Platform {
