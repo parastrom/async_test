@@ -1,7 +1,8 @@
+use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::io::Result;
 
-use crate::platform::file_open;
+use crate::platform::{file_open, file_close, file_write, file_read};
 
 pub struct OpenOptions {
     pub(crate) read: bool,
@@ -56,10 +57,26 @@ impl OpenOptions {
     }
 }
 
-pub struct File(std::fs::File);
+pub struct File(ManuallyDrop<std::fs::File>);
 
 impl File {
     pub async fn open<T: AsRef<Path>>(path: T, opts: &OpenOptions) -> Result<Self> {
-        file_open::<std::fs::File>(path.as_ref(), opts).await.map(|file| Self(file))
+        file_open(path.as_ref(), opts)
+        .await
+        .map(|file| Self(ManuallyDrop::new(file)))
+    }
+
+    pub async fn read(&self, buf: &mut [u8]) -> Result<usize> {
+        file_read(&self.0, buf).await
+    }
+
+    pub async fn write(&self, buf: &[u8]) -> Result<usize> {
+        file_write(&self.0, buf).await
+    }
+}
+
+impl Drop for File {
+    fn drop(&mut self) {
+        file_close(&self.0);
     }
 }
